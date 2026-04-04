@@ -7,7 +7,7 @@ import { Scheduler } from '../engine/scheduler.js';
 export const scheduleTools: Tool[] = [
   {
     name: 'reschedule_project',
-    description: '重新计算项目中所有任务的开始/结束日期，自动跳过节假日和周末，遵守前置任务约束。',
+    description: '重新计算项目中所有任务的开始/结束日期，自动跳过节假日（含中国法定节假日2024-2027）和周末，遵守前置任务约束。⚠️ 最佳实践：在添加完所有任务和依赖后统一调用一次，而不是每加一个任务就调用。这是修正日期（包括非工作日）的唯一推荐方式。',
     inputSchema: {
       type: 'object',
       properties: {

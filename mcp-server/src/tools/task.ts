@@ -1,9 +1,10 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import type { Task, DependencyType } from '../types.js';
+import type { Task, DependencyType, CalendarConfig } from '../types.js';
 import { saveProject, loadProject } from '../storage.js';
 import { generateId, isDescendant } from '../lib/utils.js';
 import { calculateNextWbs, recalculateAllWbs } from '../lib/wbs.js';
-import { format } from 'date-fns';
+import { format, parseISO } from 'date-fns';
+import { isWorkingDay, snapToWorkingDay } from '../lib/calendar.js';
 
 export const taskTools: Tool[] = [
   {
@@ -28,7 +29,7 @@ export const taskTools: Tool[] = [
         assignee: { type: 'string', description: '负责人（可选）' },
         notes: { type: 'string', description: '备注（可选）' },
         parentId: { type: 'string', description: '父任务 ID（可选，不填则为顶层任务）' },
-        startDate: { type: 'string', description: '手动指定开始日期 yyyy-MM-dd（可选，有前置任务时会被排程覆盖）' },
+        startDate: { type: 'string', description: '手动指定开始日期 yyyy-MM-dd（可选，强烈建议不填，统一由 reschedule_project 自动计算；若填写非工作日会自动顺延到下一个工作日）' },
         dependencies: {
           type: 'array',
           description: '前置任务列表（可选）',
@@ -65,8 +66,8 @@ export const taskTools: Tool[] = [
         progress: { type: 'number', description: '完成百分比 0-100' },
         assignee: { type: 'string' },
         notes: { type: 'string' },
-        startDate: { type: 'string', description: 'yyyy-MM-dd' },
-        endDate: { type: 'string', description: 'yyyy-MM-dd' },
+        startDate: { type: 'string', description: 'yyyy-MM-dd（非工作日会自动顺延；建议用 reschedule_project 代替手动设置日期）' },
+        endDate: { type: 'string', description: 'yyyy-MM-dd（非工作日会自动顺延；建议用 reschedule_project 代替手动设置日期）' },
       },
       required: ['projectId', 'taskId'],
     },
@@ -133,6 +134,26 @@ export const taskTools: Tool[] = [
   },
 ];
 
+/**
+ * 验证并修正日期：若日期不是工作日，自动顺延到下一个工作日并返回警告
+ */
+function validateAndSnapDate(
+  dateStr: string,
+  fieldName: string,
+  calendarConfig: CalendarConfig
+): { date: string; warning: string | null } {
+  const date = parseISO(dateStr);
+  if (!isWorkingDay(date, calendarConfig)) {
+    const snapped = snapToWorkingDay(date, calendarConfig);
+    const snappedStr = format(snapped, 'yyyy-MM-dd');
+    return {
+      date: snappedStr,
+      warning: `⚠️ ${fieldName} "${dateStr}" 是非工作日（周末或节假日），已自动顺延到 ${snappedStr}`,
+    };
+  }
+  return { date: dateStr, warning: null };
+}
+
 function getAllDescendantIds(tasks: Task[], taskId: string): string[] {
   const task = tasks.find(t => t.id === taskId);
   if (!task?.children?.length) return [];
@@ -166,10 +187,26 @@ export function handleTaskTool(name: string, args: Record<string, unknown>) {
 
   const now = new Date().toISOString();
 
+  const calendarConfig: CalendarConfig = {
+    workingHours: { start: 9, end: 18 },
+    holidays: project.holidays,
+    workingDays: project.workingDays,
+  };
+
   switch (name) {
     case 'add_task': {
       const parentId = args.parentId as string | undefined;
       const wbs = calculateNextWbs(project.tasks, parentId);
+      const warnings: string[] = [];
+
+      // 验证并修正 startDate
+      let startDate = args.startDate as string | undefined;
+      if (startDate) {
+        const result = validateAndSnapDate(startDate, 'startDate', calendarConfig);
+        startDate = result.date;
+        if (result.warning) warnings.push(result.warning);
+      }
+
       const task: Task = {
         id: generateId(),
         name: args.name as string,
@@ -186,7 +223,7 @@ export function handleTaskTool(name: string, args: Record<string, unknown>) {
         duration: (args.duration as number) ?? 1,
         assignee: args.assignee as string | undefined,
         notes: args.notes as string | undefined,
-        startDate: args.startDate as string | undefined,
+        startDate,
         createdAt: now,
         updatedAt: now,
       };
@@ -206,7 +243,9 @@ export function handleTaskTool(name: string, args: Record<string, unknown>) {
       project.tasks = tasks;
       project.updatedAt = now;
       saveProject(project);
-      return { content: [{ type: 'text', text: `任务已添加\n\n${JSON.stringify(task, null, 2)}` }] };
+
+      const warningMsg = warnings.length > 0 ? `\n\n${warnings.join('\n')}\n\n💡 建议：日期由 reschedule_project 自动计算，避免手动指定。` : '';
+      return { content: [{ type: 'text', text: `任务已添加${warningMsg}\n\n${JSON.stringify(task, null, 2)}` }] };
     }
 
     case 'update_task': {
@@ -215,15 +254,30 @@ export function handleTaskTool(name: string, args: Record<string, unknown>) {
       if (idx === -1) return { content: [{ type: 'text', text: `任务 ${taskId} 不存在` }], isError: true };
 
       const updates: Partial<Task> = {};
-      const fields = ['name', 'type', 'duration', 'priority', 'status', 'progress', 'assignee', 'notes', 'startDate', 'endDate'] as const;
-      for (const f of fields) {
+      const warnings: string[] = [];
+      const nonDateFields = ['name', 'type', 'duration', 'priority', 'status', 'progress', 'assignee', 'notes'] as const;
+      for (const f of nonDateFields) {
         if (args[f] !== undefined) (updates as Record<string, unknown>)[f] = args[f];
+      }
+
+      // 验证并修正日期字段
+      if (args.startDate !== undefined) {
+        const result = validateAndSnapDate(args.startDate as string, 'startDate', calendarConfig);
+        updates.startDate = result.date;
+        if (result.warning) warnings.push(result.warning);
+      }
+      if (args.endDate !== undefined) {
+        const result = validateAndSnapDate(args.endDate as string, 'endDate', calendarConfig);
+        updates.endDate = result.date;
+        if (result.warning) warnings.push(result.warning);
       }
 
       project.tasks[idx] = { ...project.tasks[idx], ...updates, updatedAt: now };
       project.updatedAt = now;
       saveProject(project);
-      return { content: [{ type: 'text', text: `任务已更新\n\n${JSON.stringify(project.tasks[idx], null, 2)}` }] };
+
+      const warningMsg = warnings.length > 0 ? `\n\n${warnings.join('\n')}\n\n💡 建议：手动修改日期后，请调用 reschedule_project 重新计算所有相关任务。` : '';
+      return { content: [{ type: 'text', text: `任务已更新${warningMsg}\n\n${JSON.stringify(project.tasks[idx], null, 2)}` }] };
     }
 
     case 'delete_task': {
